@@ -2,11 +2,17 @@
 
 #define AMD_PARAMS (2)
 #define AMD_SYNTAX "<uuid> <command>"
+#define AMD_BACKGROUND_SYNTAX "[start|stop]"
+
+/* Media bug name and the channel private slot used to keep track of it */
+#define AMD_BUG_FUNCTION "amd"
+#define AMD_BUG_PRIVATE "_amd_background_"
 
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_amd_shutdown);
 SWITCH_MODULE_LOAD_FUNCTION(mod_amd_load);
 SWITCH_MODULE_DEFINITION(mod_amd, mod_amd_load, mod_amd_shutdown, NULL);
 SWITCH_STANDARD_APP(amd_start_function);
+SWITCH_STANDARD_APP(amd_background_function);
 
 static struct {
 	uint32_t initial_silence;
@@ -96,9 +102,31 @@ static switch_xml_config_item_t instructions[] = {
 	SWITCH_CONFIG_ITEM_END()
 };
 
-static switch_status_t do_config(switch_bool_t reload)
+/*
+ * The defaults of the config items are only applied for the parameters that
+ * amd.conf actually sets, switch_xml_config_parse_module_settings() returns
+ * FAILURE without applying anything at all when the file is missing. Without
+ * this every setting would be 0, which classifies every single frame as voiced
+ * and reports a machine on the very first frame.
+ */
+static void set_default_config(void)
 {
 	memset(&globals, 0, sizeof(globals));
+
+	globals.initial_silence = 2500;
+	globals.greeting = 1500;
+	globals.after_greeting_silence = 800;
+	globals.total_analysis_time = 5000;
+	globals.minimum_word_length = 100;
+	globals.between_words_silence = 50;
+	globals.maximum_number_of_words = 3;
+	globals.maximum_word_length = 5000;
+	globals.silence_threshold = 256;
+}
+
+static switch_status_t do_config(switch_bool_t reload)
+{
+	set_default_config();
 
 	if (switch_xml_config_parse_module_settings("amd.conf", reload, instructions) != SWITCH_STATUS_SUCCESS) {
 		return SWITCH_STATUS_FALSE;
@@ -122,6 +150,18 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_amd_load)
 		"Asterisk's AMD (Blocking)",
 		amd_start_function,
 		NULL,
+		SAF_NONE);
+
+	SWITCH_ADD_APP(
+		app_interface,
+		"amd_background",
+		"Voice activity detection (non blocking)",
+		"Start or stop voice activity detection in the background. The result is\n"
+		"published as the channel variables amd_result/amd_cause and as a\n"
+		"CUSTOM amd::result event. Detection keeps running while the channel\n"
+		"plays audio or waits for input.",
+		amd_background_function,
+		AMD_BACKGROUND_SYNTAX,
 		SAF_NONE);
 
 	return SWITCH_STATUS_SUCCESS;
@@ -185,6 +225,10 @@ static amd_frame_classifier classify_frame(const switch_frame_t *f, const switch
 	uint32_t score, count, j;
 	double energy;
 	int divisor;
+
+	if (f->samples == 0 || f->datalen == 0) {
+		return SILENCE;
+	}
 
 	divisor = codec->actual_samples_per_second / 8000;
 
@@ -329,6 +373,250 @@ static switch_bool_t amd_handle_voiced_frame(amd_vad_t *vad, const switch_frame_
 	}
 
 	return SWITCH_FALSE;
+}
+
+/*
+ * Background (non blocking) detection.
+ *
+ * The blocking "amd" application consumes the read leg of the channel until a
+ * verdict is reached, which means the IVR can not play a greeting or wait for
+ * input at the same time. The background variant attaches a media bug instead:
+ * the application returns as soon as the bug is in place and the audio keeps
+ * flowing through the bug while the channel is being used for something else
+ * (playback pumps the read leg once per frame written).
+ */
+typedef struct {
+	amd_vad_t vad;
+	switch_media_bug_t *bug;
+	switch_time_t start_time;
+	switch_bool_t finished;
+} amd_bug_t;
+
+static void amd_finish(amd_bug_t *abug)
+{
+	abug->finished = SWITCH_TRUE;
+	amd_fire_event(&abug->vad);
+}
+
+static switch_bool_t amd_bug_callback(switch_media_bug_t *bug, void *user_data, switch_abc_type_t type)
+{
+	amd_bug_t *abug = (amd_bug_t *) user_data;
+	switch_bool_t rval = SWITCH_TRUE;
+
+	if (abug == NULL) {
+		return SWITCH_FALSE;
+	}
+
+	switch (type) {
+	case SWITCH_ABC_TYPE_INIT:
+		switch_log_printf(
+			SWITCH_CHANNEL_SESSION_LOG(abug->vad.session),
+			SWITCH_LOG_DEBUG,
+			"AMD: Background detection initialized\n");
+		break;
+
+	case SWITCH_ABC_TYPE_CLOSE:
+		if (switch_channel_get_private(abug->vad.channel, AMD_BUG_PRIVATE) == abug) {
+			switch_channel_set_private(abug->vad.channel, AMD_BUG_PRIVATE, NULL);
+		}
+
+		/* Reached when the bug is pruned before any verdict was made */
+		if (!abug->finished && switch_channel_ready(abug->vad.channel)) {
+			switch_log_printf(
+				SWITCH_CHANNEL_SESSION_LOG(abug->vad.session),
+				SWITCH_LOG_DEBUG,
+				"AMD: Timeout (elapsed: %u ms)\n",
+				(uint32_t) ((switch_micro_time_now() - abug->start_time) / 1000));
+
+			switch_channel_set_variable(abug->vad.channel, "amd_result", "NOTSURE");
+			switch_channel_set_variable(abug->vad.channel, "amd_cause", "TOOLONG");
+			amd_finish(abug);
+		}
+
+		return SWITCH_TRUE;
+
+	case SWITCH_ABC_TYPE_READ_REPLACE:
+	{
+		switch_frame_t *read_frame = switch_core_media_bug_get_read_replace_frame(bug);
+		switch_codec_implementation_t read_impl = { 0 };
+		uint32_t elapsed_ms;
+
+		if (abug->finished || read_frame == NULL) {
+			break;
+		}
+
+		switch_core_session_get_read_impl(abug->vad.session, &read_impl);
+
+		/*
+		 * Frames generated by the endpoint while the far end is silent carry
+		 * no samples at all, use the negotiated packet time for them so that
+		 * silence keeps being accounted for.
+		 */
+		if (read_frame->samples > 0 && read_frame->samples <= read_impl.actual_samples_per_second) {
+			abug->vad.frame_ms = 1000 / (read_impl.actual_samples_per_second / read_frame->samples);
+		} else {
+			abug->vad.frame_ms = read_impl.microseconds_per_packet / 1000;
+		}
+
+		if (abug->vad.frame_ms == 0) {
+			abug->vad.frame_ms = 20;
+		}
+
+		elapsed_ms = (uint32_t) ((switch_micro_time_now() - abug->start_time) / 1000);
+
+		if (globals.total_analysis_time && elapsed_ms >= globals.total_analysis_time) {
+			switch_log_printf(
+				SWITCH_CHANNEL_SESSION_LOG(abug->vad.session),
+				SWITCH_LOG_DEBUG,
+				"AMD: Timeout (elapsed: %u ms)\n",
+				elapsed_ms);
+
+			switch_channel_set_variable(abug->vad.channel, "amd_result", "NOTSURE");
+			switch_channel_set_variable(abug->vad.channel, "amd_cause", "TOOLONG");
+			amd_finish(abug);
+			rval = SWITCH_FALSE;
+			break;
+		}
+
+		switch (classify_frame(read_frame, &read_impl)) {
+		case SILENCE:
+			switch_log_printf(
+				SWITCH_CHANNEL_SESSION_LOG(abug->vad.session),
+				SWITCH_LOG_DEBUG,
+				"AMD: Silence\n");
+
+			if (amd_handle_silence_frame(&abug->vad, read_frame)) {
+				amd_finish(abug);
+				rval = SWITCH_FALSE;
+			}
+			break;
+
+		case VOICED:
+		default:
+			switch_log_printf(
+				SWITCH_CHANNEL_SESSION_LOG(abug->vad.session),
+				SWITCH_LOG_DEBUG,
+				"AMD: Voiced\n");
+
+			if (amd_handle_voiced_frame(&abug->vad, read_frame)) {
+				amd_finish(abug);
+				rval = SWITCH_FALSE;
+			}
+			break;
+		}
+
+		break;
+	}
+
+	default:
+		break;
+	}
+
+	return rval;
+}
+
+SWITCH_STANDARD_APP(amd_background_function)
+{
+	switch_channel_t *channel;
+	amd_bug_t *abug = NULL;
+	switch_status_t status;
+	const char *cmd = zstr(data) ? "start" : data;
+
+	if (!session) {
+		return;
+	}
+
+	channel = switch_core_session_get_channel(session);
+
+	if (!switch_channel_ready(channel)) {
+		return;
+	}
+
+	abug = (amd_bug_t *) switch_channel_get_private(channel, AMD_BUG_PRIVATE);
+
+	if (!strcasecmp(cmd, "stop")) {
+		if (abug == NULL) {
+			switch_log_printf(
+				SWITCH_CHANNEL_SESSION_LOG(session),
+				SWITCH_LOG_DEBUG,
+				"AMD: Background detection is not running\n");
+			return;
+		}
+
+		/* Silence the callback, a stopped detection has no verdict to report */
+		abug->finished = SWITCH_TRUE;
+		switch_channel_set_private(channel, AMD_BUG_PRIVATE, NULL);
+		switch_core_media_bug_remove(session, &abug->bug);
+
+		switch_log_printf(
+			SWITCH_CHANNEL_SESSION_LOG(session),
+			SWITCH_LOG_DEBUG,
+			"AMD: Background detection stopped\n");
+		return;
+	}
+
+	if (strcasecmp(cmd, "start")) {
+		switch_log_printf(
+			SWITCH_CHANNEL_SESSION_LOG(session),
+			SWITCH_LOG_ERROR,
+			"AMD: Unknown command '%s', expected start or stop\n",
+			cmd);
+		return;
+	}
+
+	if (abug != NULL) {
+		switch_log_printf(
+			SWITCH_CHANNEL_SESSION_LOG(session),
+			SWITCH_LOG_ERROR,
+			"AMD: Background detection already running\n");
+		return;
+	}
+
+	/* The detection lives as long as the session, no extra pool needed */
+	abug = (amd_bug_t *) switch_core_session_alloc(session, sizeof(*abug));
+
+	if (abug == NULL) {
+		switch_log_printf(
+			SWITCH_CHANNEL_SESSION_LOG(session),
+			SWITCH_LOG_ERROR,
+			"AMD: Unable to allocate memory\n");
+		return;
+	}
+
+	memset(abug, 0, sizeof(*abug));
+
+	abug->vad.session = session;
+	abug->vad.channel = channel;
+	abug->vad.state = VAD_STATE_IN_WORD;
+	abug->vad.in_initial_silence = 1;
+	abug->start_time = switch_micro_time_now();
+
+	status = switch_core_media_bug_add(
+		session,
+		AMD_BUG_FUNCTION,
+		NULL,
+		amd_bug_callback,
+		abug,
+		/* stop_time of a media bug is an absolute epoch time in seconds */
+		switch_epoch_time_now(NULL) + (globals.total_analysis_time / 1000),
+		SMBF_READ_REPLACE | SMBF_ONE_ONLY,
+		&abug->bug);
+
+	if (status != SWITCH_STATUS_SUCCESS || abug->bug == NULL) {
+		switch_log_printf(
+			SWITCH_CHANNEL_SESSION_LOG(session),
+			SWITCH_LOG_ERROR,
+			"AMD: Unable to add media bug (%d)\n",
+			status);
+		return;
+	}
+
+	switch_channel_set_private(channel, AMD_BUG_PRIVATE, abug);
+
+	switch_log_printf(
+		SWITCH_CHANNEL_SESSION_LOG(session),
+		SWITCH_LOG_DEBUG,
+		"AMD: Background detection started\n");
 }
 
 SWITCH_STANDARD_APP(amd_start_function)
