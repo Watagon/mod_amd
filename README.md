@@ -11,6 +11,13 @@ diallers and automated call campaigns, where you want to route live humans to
 agents and handle machine answers differently (e.g. leave a voicemail or hang
 up).
 
+The module ships two applications:
+
+- **`amd`** — blocks the session until a verdict is reached.
+- **`amd_background`** — keeps analysing the call while the dialplan goes on
+  (playing prompts, collecting digits, …) and reports the verdict
+  asynchronously.
+
 How It Works
 ------------
 
@@ -83,7 +90,9 @@ To load it automatically on startup, add the following to
 Configuration
 -------------
 
-Place the configuration file at **`conf/autoload_configs/amd.conf.xml`**:
+Place the configuration file at **`conf/autoload_configs/amd.conf.xml`**.
+Individual parameters may be omitted: the defaults below are applied for any
+missing value, including when the file does not exist at all.
 
 ```xml
 <configuration name="amd.conf" description="mod_amd Configuration">
@@ -123,10 +132,43 @@ freeswitch> reloadxml
 freeswitch> reload mod_amd
 ```
 
+Applications
+------------
+
+### `amd` — blocking
+
+```
+amd
+```
+
+Reads the audio of the channel in the session thread and returns only when a
+verdict (or `total_analysis_time`) is reached. Simple, but it holds the dialplan
+for up to `total_analysis_time`.
+
+### `amd_background` — non blocking
+
+```
+amd_background [start|stop]
+```
+
+`start` attaches a media bug to the channel and returns immediately: detection
+runs in the media thread while the dialplan does something else. `stop` removes
+the bug; a stopped detection has no verdict to report.
+
+- Only one background detection runs per channel: a second `start` is refused
+  and a `stop` without a running detection is a no-op.
+- As soon as it has a verdict (or `total_analysis_time` expires) the detection
+  publishes `amd_result` / `amd_cause` and the `CUSTOM amd::result` event, then
+  removes its own media bug.
+- The analysis runs on the **read leg**, i.e. it hears what the remote party
+  sends. Audio that FreeSWITCH itself plays to the party (prompts, TTS) is on
+  the write leg and is not analysed.
+
 Channel Variables
 -----------------
 
-After the `amd` application completes, two channel variables are set:
+After a detection ends, two channel variables are set (by `amd`, and by
+`amd_background` at the moment its detection finishes):
 
 | Variable | Values | Description |
 |---|---|---|
@@ -139,7 +181,8 @@ based on the detection outcome.
 Events
 ------
 
-When a detection decision is made, `mod_amd` fires a custom event:
+When a detection decision is made, `mod_amd` fires a custom event (both
+applications):
 
 - **Event**: `CUSTOM`
 - **Subclass**: `amd::result`
@@ -218,6 +261,31 @@ A simpler approach using inline conditions:
 </extension>
 ```
 
+### Dialplan — Non Blocking Detection
+
+Start the detection, keep running the IVR (playing prompts, collecting digits)
+and check the result afterwards:
+
+```xml
+<extension name="amd_background">
+  <condition field="destination_number" expression="^(\d+)$">
+    <action application="answer"/>
+    <action application="amd_background" data="start"/>
+
+    <!-- Detection runs while these are executed -->
+    <action application="playback" data="welcome.wav"/>
+    <action application="sleep" data="1000"/>
+
+    <action application="log" data="INFO AMD: ${amd_result} (${amd_cause})"/>
+    <action application="amd_background" data="stop"/>
+  </condition>
+</extension>
+```
+
+The variables are only usable once the detection ends. To branch **while the
+call goes on** subscribe to the `CUSTOM amd::result` event (see below) instead of
+reading the variables, and jump to your machine/human handler from there.
+
 ### Lua Script
 
 Use AMD from a Lua script:
@@ -245,7 +313,9 @@ end
 
 ### ESL Event Subscription (Python)
 
-Subscribe to AMD events using the FreeSWITCH Event Socket Library:
+Subscribe to AMD events using the FreeSWITCH Event Socket Library. This is also
+how you get the result of an `amd_background` detection as soon as it is
+available, without polling the channel variables:
 
 ```python
 import ESL
