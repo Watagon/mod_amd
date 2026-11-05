@@ -11,12 +11,17 @@ diallers and automated call campaigns, where you want to route live humans to
 agents and handle machine answers differently (e.g. leave a voicemail or hang
 up).
 
-The module ships two applications:
+The module ships two native applications plus a set of applications that are
+interface compatible with the commercial `mod_com_amd`:
 
 - **`amd`** — blocks the session until a verdict is reached.
 - **`amd_background`** — keeps analysing the call while the dialplan goes on
   (playing prompts, collecting digits, …) and reports the verdict
   asynchronously.
+- **`voice_start` / `voice_stop` / `waitforresult`** — the `mod_com_amd`
+  compatible interface (see [mod_com_amd compatible interface](#mod_com_amd-compatible-interface)).
+  Existing dialplans and scripts written for `mod_com_amd` work without the
+  commercial licence.
 
 How It Works
 ------------
@@ -132,6 +137,38 @@ freeswitch> reloadxml
 freeswitch> reload mod_amd
 ```
 
+### `mod_com_amd` compatible parameters
+
+`mod_com_amd` uses different names for the same knobs. `amd.conf` accepts both
+families: a name only updates the interface it belongs to, so a native
+`amd.conf` does not change the defaults of `voice_start` (and vice versa).
+`silence_threshold` (aka `silent_threshold`) and `total_analysis_time` are
+shared and update both.
+
+The defaults of the compatible interface mirror the values shipped in
+`mod_com_amd`'s `amd.conf.xml`, so `voice_start` behaves the same out of the
+box:
+
+| `mod_com_amd` name | Native name | Compat default | Notes |
+|---|---|---|---|
+| `silent_threshold` | `silence_threshold` | `256` | Shared |
+| `silent_initial` | `initial_silence` | `4500` | Person / `silent-initial` |
+| `silent_after_intro` | `after_greeting_silence` | `500` | Person / `silent-after-intro` |
+| `noise_max_intro` | `greeting` | `1250` | Machine / `max-count` |
+| `noise_min_length` | `min_word_length` | `120` | Minimum word length |
+| `noise_inter_silence` | `between_words_silence` | `50` | Word boundary |
+| `noise_max_count` | `maximum_number_of_words` | `3` | Machine / `max-count` |
+| `total_analysis_time` | `total_analysis_time` | `5000` | Shared, milliseconds |
+| – | `maximum_word_length` | `0` (disabled) | `mod_com_amd` has no such rule |
+| `silent_max_session` | – | ignored | Accepted for compatibility |
+| `ring_timeout` | – | ignored | Accepted for compatibility |
+| `break_digit` | – | ignored | Accepted for compatibility |
+
+`hangup_on_bug_fail` (default `true`), `event_fire` (default `false`) and
+`debug` / `debug_loglevel` only exist in the compatible interface as well.
+`hangup_on_bug_fail` hangs the call up when the media bug cannot be added, the
+same way `mod_com_amd` does.
+
 Applications
 ------------
 
@@ -164,6 +201,141 @@ the bug; a stopped detection has no verdict to report.
   sends. Audio that FreeSWITCH itself plays to the party (prompts, TTS) is on
   the write leg and is not analysed.
 
+### `mod_com_amd` compatible interface
+
+The commercial `mod_com_amd` module is not available on every installation
+(it needs a licence). `mod_amd` implements its documented interface on top of
+the same VAD, so a flow written for `mod_com_amd` keeps working:
+
+| Application | Arguments | Description |
+|---|---|---|
+| `voice_start` | `[key=value,key=value,...]` | Starts one background detection per channel and returns immediately. Optional overrides of the settings, applied to this detection only. |
+| `voice_stop` | – | Removes the media bug. A stopped detection has **no** verdict. |
+| `waitforresult` | `[file]` | Answers the channel if needed and blocks until the detection has a verdict, playing `file` to pump the read leg. With no argument, or the literal word `silence`, it plays silence. |
+
+```
+<extension name="amd_compat">
+  <condition field="destination_number" expression="^(\d+)$">
+    <action application="answer"/>
+    <action application="voice_start" data="silent_initial=6000,noise_max_count=4"/>
+    <action application="waitforresult"/>
+    <action application="log" data="INFO AMD: ${amd_status} (${amd_result})"/>
+  </condition>
+</extension>
+```
+
+- `voice_start` only attaches the media bug. The bug is driven by the session's
+  read path, so the channel has to be busy: either run `waitforresult` (which
+  plays silence) or keep the dialplan playing prompts / collecting input. An
+  idle session that runs nothing does not read frames and the detection never
+  progresses.
+- One detection per channel: a second `voice_start` is refused with
+  `AMD: Only 1 AMD per channel please!` and, with `hangup_on_bug_fail=true`
+  (the default), the call is hung up — the same behaviour as `mod_com_amd`.
+- Overrides are parsed before `voice_start` applies them, so they accept both
+  name families, at most 20 pairs, case insensitive.
+- `total_analysis_time` is the module timeout **and** the media bug's
+  `stop_time`, so a verdict is published even if nothing pumps the read leg
+  (the bug is pruned and publishes `too-long`). The verdict is timed in
+  milliseconds by the media bug; `stop_time` is only a seconds resolution
+  ceiling and is rounded up, so it never cuts a detection short. Keep
+  `total_analysis_time` below the Event Socket command-response timeout (30 s
+  by default) when `waitforresult` is driven from an event socket with the
+  lock flag.
+  - Unit note: `mod_com_amd` measures this budget in units of 1,000 bytes of
+    decoded audio (about 62 ms at 8 kHz), so the packaged `5000` is roughly
+    five minutes there, not five seconds. `mod_amd` uses **milliseconds** for
+    both interfaces (and `0` means "no budget"), so a value tuned for
+    `mod_com_amd`'s units has to be converted (e.g. `80` → `5000`).
+
+#### Channel variables
+
+`voice_start` clears the previous verdict; when the detection ends it sets:
+
+| Variable | Values |
+|---|---|
+| `amd_status` | `person`, `machine`, `unsure`, `undefined` |
+| `amd_result` | `silent-initial`, `silent-after-intro`, `max-count`, `too-long`, `media-bug-failed` |
+
+`amd_status=undefined` / `amd_result=media-bug-failed` means the media bug
+could not be added. If the channel hangs up before a verdict,
+`waitforresult` sets `amd_wait_status` / `amd_wait_result` to `hangup`.
+
+The mapping between the two interfaces:
+
+| Native (`amd` / `amd_background`) | Compatible (`voice_start`) |
+|---|---|
+| `MACHINE` / `INITIALSILENCE` | `person` / `silent-initial` |
+| `HUMAN` / `HUMAN` | `person` / `silent-after-intro` |
+| `MACHINE` / `LONGGREETING` | `machine` / `max-count` |
+| `MACHINE` / `MAXWORDLENGTH` | `machine` / `max-count` |
+| `MACHINE` / `MAXWORDS` | `machine` / `max-count` |
+| `NOTSURE` / `TOOLONG` | `unsure` / `too-long` |
+
+Note that initial silence means a **person** in the compatible interface: a
+human picks up and says nothing (or waits for the IVR), whereas an answering
+machine starts its greeting. The native `amd` application keeps its original
+Asterisk semantics where initial silence is a machine.
+
+Setting `amd_debug` to a true value before `voice_start` turns on the debug
+logging of that detection.
+
+#### Actions on completion
+
+`mod_com_amd` can run dialplan applications automatically when the verdict is
+in. `mod_amd` honours the same channel variables: every variable whose name
+begins with `amd_execute_on_<status>` is executed when the detection ends with
+that status (`machine`, `person` or `unsure`). The value is an application and
+an optional argument, and `${...}` variables in the argument are expanded when
+the action runs (not when it is set).
+
+```
+<extension name="amd_execute_on">
+  <condition field="destination_number" expression="^(\d+)$">
+    <action application="set" data="amd_execute_on_machine=transfer machine_detected XML default"/>
+    <action application="set" data="amd_execute_on_person=playback ${sound_prefix}/ivr/ivr-welcome_to_freeswitch.wav"/>
+    <action application="voice_start"/>
+    <action application="waitforresult"/>
+    <action application="hangup"/>
+  </condition>
+</extension>
+```
+
+The actions are queued as session private commands with `event-lock`, so they
+interrupt the application that is running when the verdict arrives (for
+instance the `waitforresult` playback) the same way `mod_com_amd` does.
+
+#### Events
+
+When `event_fire=false` (the default) the verdict is queued to the session as a
+`DETECTED_SPEECH` event, which an outbound Event Socket receives while
+`divert_events` is on. The flag is per channel and stays set for the rest of
+the call; an application that clears it (for example to avoid duplicate
+delivery while it runs its own speech detection) has to set it again before
+`voice_start`:
+
+- **Event**: `DETECTED_SPEECH`
+- **Headers**: `Speech-Type: detected-speech`, `amd_status`, `amd_result`
+- **Body**: `amd_complete`
+
+With `event_fire=true` the same event is fired globally with the channel
+headers instead (so `myevents` filtering applies), and it carries
+`Unique-ID` like any other channel event.
+
+While the detection runs, `CUSTOM AMD::EVENT` is fired on every talk state
+change with an `Action` header of `start-talking` or `stop-talking` (compatible
+interface only).
+
+#### APIs
+
+| API | Output |
+|---|---|
+| `amd_available` | `true` (there is no licence server) |
+| `amd_count` | `65535` |
+| `amd_info` | `AMD license available => 65535`, `AMD license allocated => 0` |
+
+These exist so monitoring / dialler code that probes `mod_com_amd` also works.
+
 Channel Variables
 -----------------
 
@@ -178,11 +350,15 @@ After a detection ends, two channel variables are set (by `amd`, and by
 These variables can be used in your dialplan or scripts to branch call logic
 based on the detection outcome.
 
+The compatible interface (`voice_start`) uses its own variables instead —
+`amd_status` / `amd_result`, see
+[mod_com_amd compatible interface](#mod_com_amd-compatible-interface).
+
 Events
 ------
 
-When a detection decision is made, `mod_amd` fires a custom event (both
-applications):
+When a native detection decision is made, `mod_amd` fires a custom event (both
+`amd` and `amd_background`):
 
 - **Event**: `CUSTOM`
 - **Subclass**: `amd::result`
